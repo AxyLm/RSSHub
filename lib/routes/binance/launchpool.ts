@@ -18,9 +18,8 @@ export const route: Route = {
 };
 
 async function handler() {
-    const baseUrl = 'https://www.binance.com/zh-CN/support/announcement';
-    const url = `${baseUrl}/数字货币及交易对上新?c=48&navId=48`;
-
+    const baseUrl = 'https://www.binance.com/en/support/announcement';
+    const url = `${baseUrl}/new-cryptocurrency-listing?c=48&navId=48`;
     const response = await got({
         url,
         headers: {

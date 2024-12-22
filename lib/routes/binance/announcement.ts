@@ -1,13 +1,12 @@
-import { DataItem, Route, ViewType } from '@/types';
+import { Route, ViewType } from '@/types';
 import cache from '@/utils/cache';
-import ofetch from '@/utils/ofetch';
+import logger from '@/utils/logger';
 import { parseDate } from '@/utils/parse-date';
 import * as cheerio from 'cheerio';
-import { AnnouncementCatalog, AnnouncementsConfig } from './types';
-
-interface AnnouncementFragment {
-    reactRoot: [{ id: 'Fragment'; children: { id: string; props: object }[]; props: object }];
-}
+import puppeteer from '@/utils/puppeteer';
+import ofetch from '@/utils/ofetch';
+import { randUserAgent } from '@tonyrl/rand-user-agent';
+import { Browser } from 'puppeteer';
 
 const ROUTE_PARAMETERS_CATALOGID_MAPPING = {
     'new-cryptocurrency-listing': 48,
@@ -19,114 +18,105 @@ const ROUTE_PARAMETERS_CATALOGID_MAPPING = {
     'wallet-maintenance-updates': 157,
     delisting: 161,
 };
-
-function assertAnnouncementsConfig(playlist: unknown): playlist is AnnouncementFragment {
-    if (!playlist || typeof playlist !== 'object') {
-        return false;
-    }
-    if (!('reactRoot' in (playlist as { reactRoot: unknown[] }))) {
-        return false;
-    }
-    if (!Array.isArray((playlist as { reactRoot: unknown[] }).reactRoot)) {
-        return false;
-    }
-    if ((playlist as { reactRoot: { id: string }[] }).reactRoot?.[0]?.id !== 'Fragment') {
-        return false;
-    }
-    return true;
+interface BNApiResult {
+    code: string;
+    message: null;
+    messageDetail: null;
+    data: Data;
+    success: boolean;
+}
+interface Data {
+    catalogs: Catalog[];
+}
+interface Catalog {
+    catalogId: number;
+    parentCatalogId: null;
+    icon: string;
+    catalogName: string;
+    description: null;
+    catalogType: number;
+    total: number;
+    articles: Article[];
+    catalogs: any[];
 }
 
-function assertAnnouncementsConfigList(props: unknown): props is { config: { list: AnnouncementsConfig[] } } {
-    if (!props || typeof props !== 'object') {
-        return false;
-    }
-    if (!('config' in props)) {
-        return false;
-    }
-    if (!('list' in (props.config as { list: AnnouncementsConfig[] }))) {
-        return false;
-    }
-    return true;
+interface Article {
+    id: number;
+    code: string;
+    title: string;
+    type: number;
+    releaseDate: number;
 }
 
+let _browser: Browser;
 const handler: Route['handler'] = async (ctx) => {
     const baseUrl = 'https://www.binance.com';
-    const announcementCategoryUrl = `${baseUrl}/support/announcement`;
+    const language = 'en';
+    const announcementCategoryUrl = `${baseUrl}/${language}/support/announcement`;
     const { type } = ctx.req.param<'/binance/announcement/:type'>();
-    const language = ctx.req.header('Accept-Language');
-    const headers = {
-        Referer: baseUrl,
-        'Accept-Language': language ?? 'en-US,en;q=0.9',
-    };
-    const announcementsConfig = (await cache.tryGet(`binance:announcements:${language}`, async () => {
-        const announcementRes = await ofetch<string>(announcementCategoryUrl, { headers });
-        const $ = cheerio.load(announcementRes);
 
-        const appData = JSON.parse($('#__APP_DATA').text());
+    const id = ROUTE_PARAMETERS_CATALOGID_MAPPING[type];
+    const link = `${announcementCategoryUrl}/${type}?c=${id}&navId=${id}`;
 
-        const announcements = Object.values(appData.appState.loader.dataByRouteId as Record<string, object>).find((value) => 'playlist' in value) as { playlist: unknown };
-
-        if (!assertAnnouncementsConfig(announcements.playlist)) {
-            throw new Error('Get announcement config failed');
-        }
-
-        const listConfigProps = announcements.playlist.reactRoot[0].children.find((i) => i.id === 'TopicCardList')?.props;
-
-        if (!assertAnnouncementsConfigList(listConfigProps)) {
-            throw new Error("Can't get announcement config list");
-        }
-
-        return listConfigProps.config.list;
-    })) as AnnouncementsConfig[];
-
-    const announcementCatalogId = ROUTE_PARAMETERS_CATALOGID_MAPPING[type];
-
-    if (!announcementCatalogId) {
-        throw new Error(`${type} is not supported`);
-    }
-
-    const targetItem = announcementsConfig.find((i) => i.url.includes(`c-${announcementCatalogId}`));
-
-    if (!targetItem) {
-        throw new Error('Unexpected announcements config');
-    }
-
-    const link = new URL(targetItem.url, baseUrl).toString();
-
-    const response = await ofetch<string>(link, { headers });
-
-    const $ = cheerio.load(response);
-    const appData = JSON.parse($('#__APP_DATA').text());
-
-    const values = Object.values(appData.appState.loader.dataByRouteId as Record<string, object>);
-    const catalogs = values.find((value) => 'catalogs' in value) as { catalogs: AnnouncementCatalog[] };
-    const catalog = catalogs.catalogs.find((catalog) => catalog.catalogId === announcementCatalogId);
-
-    const item = await Promise.all(
-        catalog!.articles.map((i) => {
-            const link = `${announcementCategoryUrl}/${i.code}`;
-            const item = {
-                title: i.title,
-                link,
-                description: i.title,
-                pubDate: parseDate(i.releaseDate),
-            } as DataItem;
-            return cache.tryGet(`binance:announcement:${i.code}:${language}`, async () => {
-                const res = await ofetch(link, { headers });
-                const $ = cheerio.load(res);
-                const descriptionEl = $('#support_article > div').first();
-                descriptionEl.find('style').remove();
-                item.description = descriptionEl.html() ?? '';
-                return item;
-            }) as Promise<DataItem>;
+    const item = (await cache.tryGet(`binance:announcement:${type}:${id}`, async () => {
+        const articles = await ofetch<BNApiResult>('https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=10', {
+            headers: {
+                'User-Agent': randUserAgent('mac'),
+            },
+            timeout: 1.5 * 1000,
         })
-    );
+            .then((e) => {
+                const data = e.data;
+                const catalog = data.catalogs.find((e) => e.catalogId === id);
+                if (!catalog) {
+                    throw new Error('not found');
+                }
+                return catalog.articles;
+            })
+            .catch(async (error) => {
+                logger.error('get articles by api error', error);
+                if (!_browser) {
+                    _browser = await puppeteer();
+                }
+                _browser.close();
+                const page = await _browser.newPage();
+                await page.goto(link, {
+                    waitUntil: 'networkidle0',
+                });
+                await page.waitForSelector('#__APP_DATA');
+                const response = await page.content();
+                logger.info('response', response);
+                const $ = cheerio.load(response);
+                const app_data = $('#__APP_DATA').text();
+                logger.info('__APP_DATA', app_data);
+                const appData = JSON.parse(app_data);
+                const values = Object.values(appData.appState.loader.dataByRouteId as Record<string, object>);
+                logger.info(values);
+                const catalogDetail = values.find((value) => 'catalogDetail' in value)?.catalogDetail as {
+                    catalogId: number;
+                    catalogName: string;
+                    articles: { code: string; title: string; releaseDate: string; type: number }[];
+                };
+                const articles = catalogDetail.articles;
+                return articles;
+            })
+            .finally(() => {
+                _browser?.close();
+            });
+
+        return articles;
+    })) as { code: string; title: string; releaseDate: string; type: number }[];
 
     return {
-        title: targetItem.title,
+        title: `Binance ${type}`,
         link,
-        description: targetItem.description,
-        item,
+        item: item.map((article) => ({
+            title: article.title,
+            description: article.title,
+            guid: article.code,
+            pubDate: parseDate(article.releaseDate),
+            link: `${announcementCategoryUrl}/${article.code}`,
+        })),
     };
 };
 
@@ -164,6 +154,6 @@ Type category
  - wallet-maintenance-updates => Wallet Maintenance Updates
  - delisting                  => Delisting
 `,
-    maintainers: ['enpitsulin'],
+    maintainers: ['enpitsulin', 'axylm'],
     handler,
 };
