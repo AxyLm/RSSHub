@@ -103,6 +103,9 @@ export type Config = {
         username?: string;
         password?: string;
     };
+    binance: {
+        baseUrl?: string;
+    };
     btbyr: {
         host?: string;
         cookies?: string;
@@ -532,6 +535,9 @@ const calculateValue = () => {
         bitbucket: {
             username: envs.BITBUCKET_USERNAME,
             password: envs.BITBUCKET_PASSWORD,
+        },
+        binance: {
+            baseUrl: envs.BINANCE_BASE_URL,
         },
         btbyr: {
             host: envs.BTBYR_HOST,
